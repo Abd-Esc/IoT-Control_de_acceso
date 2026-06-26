@@ -5,22 +5,17 @@
 #include <ArduinoJson.h>
 #include <Adafruit_PN532.h>
 #include <ESP32Servo.h>
+#include "secrets.h"
 
 // =====================================================
 // 1. CONFIGURACIÓN WIFI Y BACKEND
 // =====================================================
 
-static const char* WIFI_SSID = "POMA";
-static const char* WIFI_PASSWORD = "andresP23";
-
-// Cambiar por la IP LAN de tu PC Fedora.
-// Ejemplo: http://192.168.1.50:8000/api/v1
-static const char* API_BASE_URL = "http://192.168.0.29:8000/api/v1";
+// WIFI_SSID, WIFI_PASSWORD, API_BASE_URL y DEVICE_API_KEY
+// se definen en secrets.h, archivo excluido de Git.
 static const char* NFC_ENDPOINT = "/acceso/nfc-scan";
+static const char* WIFI_HOSTNAME = "esp32GYM";
 
-// Actualmente el backend no exige API key.
-// Se deja preparado para producción.
-static const char* DEVICE_API_KEY = "";
 
 // =====================================================
 // 2. PINES DEL SISTEMA
@@ -44,6 +39,9 @@ static const uint8_t PIR_PIN = 25;
 // LED encendido mientras el PIR detecta movimiento
 static const uint8_t LED_PIR_PIN = 32;
 
+// LED encendido si no hay Wi-Fi o falla la comunicación de red
+static const uint8_t LED_NETWORK_ERROR_PIN = 22;
+
 // Buzzer activo para acceso denegado
 static const uint8_t BUZZER_PIN = 33;
 
@@ -65,14 +63,13 @@ static const int SERVO_PULSO_MAX_US = 2400;
 
 static const unsigned long TIEMPO_MAX_APERTURA_SIN_PIR_MS = 10000;
 
-// Modificado: antes 2000 ms, ahora 1000 ms.
 static const unsigned long TIEMPO_ESPERA_CIERRE_TRAS_PIR_LOW_MS = 1000;
 
 static const unsigned long INTERVALO_LECTURA_NFC_MS = 250;
 static const unsigned long COOLDOWN_MISMA_TARJETA_MS = 2000;
 static const unsigned long TIEMPO_ESTABILIZACION_PIR_MS = 30000;
 
-static const unsigned long DURACION_BUZZER_DENEGADO_MS = 1000;
+static const unsigned long DURACION_BUZZER_DENEGADO_MS = 500;
 static const unsigned long INTERVALO_REINTENTO_WIFI_MS = 5000;
 static const unsigned long INTERVALO_REINTENTO_PN532_MS = 5000;
 static const unsigned long HTTP_TIMEOUT_MS = 3000;
@@ -123,6 +120,9 @@ String ultimoUIDLeido = "";
 unsigned long ultimoIntentoWifi = 0;
 unsigned long ultimoIntentoPN532 = 0;
 
+bool wifiEstabaConectado = false;
+bool falloRedActivo = true;
+
 unsigned long tiempoInicioBuzzer = 0;
 bool buzzerActivo = false;
 
@@ -151,7 +151,17 @@ void encenderLedPIR(bool encendido) {
   digitalWrite(LED_PIR_PIN, encendido ? HIGH : LOW);
 }
 
+void encenderLedFalloRed(bool encendido) {
+  digitalWrite(LED_NETWORK_ERROR_PIN, encendido ? HIGH : LOW);
+}
+
+void marcarEstadoRed(bool disponible) {
+  falloRedActivo = !disponible;
+  encenderLedFalloRed(falloRedActivo);
+}
+
 void iniciarBuzzerDenegado() {
+  if (buzzerActivo) return;
   digitalWrite(BUZZER_PIN, HIGH);
   buzzerActivo = true;
   tiempoInicioBuzzer = millis();
@@ -184,29 +194,57 @@ bool leerPIR() {
 // =====================================================
 
 void iniciarWiFi() {
-  Serial.print("[WIFI] Conectando a ");
+
+  marcarEstadoRed(false);
+
+  Serial.println("[WIFI] Iniciando");
+  Serial.print("[WIFI] SSID: ");
   Serial.println(WIFI_SSID);
 
+  // Evita guardar credenciales repetidamente en memoria flash.
+  WiFi.persistent(false);
+
   WiFi.mode(WIFI_STA);
+  WiFi.setHostname(WIFI_HOSTNAME);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  wifiEstabaConectado = false;
   ultimoIntentoWifi = millis();
+
 }
 
 void actualizarWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
+  bool wifiConectado = WiFi.status() == WL_CONNECTED;
+
+  if (wifiConectado) {
+    if (!wifiEstabaConectado) {
+      wifiEstabaConectado = true;
+      marcarEstadoRed(true);
+
+      Serial.print("[WIFI] Conectado. IP: ");
+      Serial.println(WiFi.localIP());
+    }
+
+    return;
+  }
+
+  if (wifiEstabaConectado) {
+    wifiEstabaConectado = false;
+    marcarEstadoRed(false);
+    Serial.println("[WIFI] Conexion perdida.");
+  }
 
   unsigned long ahora = millis();
 
   if (ahora - ultimoIntentoWifi < INTERVALO_REINTENTO_WIFI_MS) return;
 
-  Serial.println("[WIFI] Reintentando conexion.");
-  WiFi.disconnect();
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.reconnect();
   ultimoIntentoWifi = ahora;
 }
 
 bool wifiDisponible() {
-  return WiFi.status() == WL_CONNECTED;
+  return WiFi.isConnected();
 }
 
 // =====================================================
@@ -285,6 +323,7 @@ RespuestaBackend consultarBackendNFC(const String& nfcUid) {
   respuesta.motivoDenegacion = "Error de comunicacion";
 
   if (!wifiDisponible()) {
+    marcarEstadoRed(false);
     respuesta.mensaje = "WiFi no conectado";
     return respuesta;
   }
@@ -295,11 +334,12 @@ RespuestaBackend consultarBackendNFC(const String& nfcUid) {
   String url = String(API_BASE_URL) + String(NFC_ENDPOINT);
 
   if (!http.begin(client, url)) {
+    marcarEstadoRed(false);
     respuesta.mensaje = "No se pudo iniciar HTTP";
     return respuesta;
   }
 
-  http.setTimeout(HTTP_TIMEOUT_MS);
+  //http.setTimeout(HTTP_TIMEOUT_MS);
   http.addHeader("Content-Type", "application/json");
 
   if (strlen(DEVICE_API_KEY) > 0) {
@@ -320,6 +360,12 @@ RespuestaBackend consultarBackendNFC(const String& nfcUid) {
 
   int httpCode = http.POST(requestBody);
   respuesta.httpCode = httpCode;
+
+  if (httpCode <= 0) {
+    marcarEstadoRed(false);
+  } else {
+    marcarEstadoRed(true);
+  }
 
   String responseBody = http.getString();
   http.end();
@@ -365,6 +411,14 @@ void abrirAcceso(const String& mensaje) {
   estadoActual = EstadoAcceso::ABIERTO_ESPERANDO_PIR;
 }
 
+void cerrarAccesoPorError(const String& error){
+  Serial.print("[ERROR] ");
+  Serial.println(error);
+  moverServoSiEsNecesario(SERVO_CERRADO_GRADOS);
+  encenderLedVerde(false);
+  estadoActual=EstadoAcceso::CERRADO;
+}
+
 void denegarAcceso(const String& motivo) {
   Serial.print("[ACCESO] Denegado: ");
   Serial.println(motivo);
@@ -372,7 +426,6 @@ void denegarAcceso(const String& motivo) {
   moverServoSiEsNecesario(SERVO_CERRADO_GRADOS);
   encenderLedVerde(false);
   iniciarBuzzerDenegado();
-
   estadoActual = EstadoAcceso::CERRADO;
 }
 
@@ -428,7 +481,7 @@ void leerPN532SiCorresponde() {
   RespuestaBackend respuesta = consultarBackendNFC(uidTexto);
 
   if (!respuesta.comunicacionOk) {
-    denegarAcceso(respuesta.mensaje);
+    cerrarAccesoPorError(respuesta.mensaje);
     return;
   }
 
@@ -510,18 +563,20 @@ void setup() {
 
   pinMode(LED_GREEN_PIN, OUTPUT);
   pinMode(LED_PIR_PIN, OUTPUT);
+  pinMode(LED_NETWORK_ERROR_PIN, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
-  pinMode(PIR_PIN, INPUT);
+  pinMode(PIR_PIN, INPUT_PULLDOWN);
 
   encenderLedVerde(false);
   encenderLedPIR(false);
+  encenderLedFalloRed(true);
   digitalWrite(BUZZER_PIN, LOW);
+
+  iniciarWiFi();
 
   servoAcceso.setPeriodHertz(50);
   servoAcceso.attach(SERVO_PIN, SERVO_PULSO_MIN_US, SERVO_PULSO_MAX_US);
   moverServoSiEsNecesario(SERVO_CERRADO_GRADOS);
-
-  iniciarWiFi();
 
   ultimoIntentoPN532 = millis() - INTERVALO_REINTENTO_PN532_MS;
   actualizarPN532();
